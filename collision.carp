@@ -29,6 +29,20 @@
     (Physical [Collision])
     (Triggered [Trigger]))
 
+(defmodule CollisionResult
+    (doc a "returns the handle for the first object in the collision/trigger.")
+    (defn a [res]
+        (match @res
+            (CollisionResult.Physical c) @(Collision.a &c)
+            (CollisionResult.Triggered t) @(Trigger.a &t)))
+
+    (doc b "returns the handle for the second object in the collision/trigger.")
+    (defn b [res]
+        (match @res
+            (CollisionResult.Physical c) @(Collision.b &c)
+            (CollisionResult.Triggered t) @(Trigger.b &t)))
+)
+
 (doc Collidable "is a wrapper that associates a handle with a physical volume and collision filtering metadata.")
 (deftype Collidable [
     handle (Handle ())
