@@ -1,0 +1,86 @@
+(load "../carp-geometry/geometry.carp")
+(load "../carp-handle/handle.carp")
+(load "../carp-spatial/grid.carp")
+
+(use Geometry)
+(use Handle)
+(use SpatialGrid)
+
+(doc Volume "is a sum type (variant) for geometric shapes supported by the collision system.")
+(deftype Volume
+    (Box [AABB])
+    (Ball [Sphere]))
+
+(doc Collidable "is a wrapper that associates a handle with a physical volume and collision filtering metadata.")
+(deftype Collidable [
+    handle (Handle ())
+    volume Volume
+    layer Uint32
+    mask Uint32
+])
+
+(doc Collision "represents a confirmed intersection between two collidables with contact manifold data.")
+(deftype Collision [
+    a (Handle ())
+    b (Handle ())
+    contact Contact
+])
+
+(doc Trigger "represents a confirmed intersection without contact data, useful for sensors and triggers.")
+(deftype Trigger [
+    a (Handle ())
+    b (Handle ())
+])
+
+(defmodule Collision
+    (doc get-aabb "calculates the axis-aligned bounding box for any supported volume.")
+    (defn get-aabb [v]
+        (match @v
+            (Volume.Box b) b
+            (Volume.Ball s) 
+                (let [center (Sphere.center &s)
+                      r @(Sphere.radius &s)]
+                  (AABB.init (Vector3.sub center &(Vector3.init r r r))
+                             (Vector3.add center &(Vector3.init r r r))))))
+
+    (doc collide "dispatches to the correct narrow-phase geometry test based on volume types.")
+    (defn collide [v1 v2]
+        (match @v1
+            (Volume.Box b1)
+                (match @v2
+                    (Volume.Box b2) (AABB.collide-aabb &b1 &b2)
+                    (Volume.Ball s2) (match (Sphere.collide-aabb &s2 &b1)
+                                        (Maybe.Just c) (Maybe.Just (Contact.init @(Contact.depth &c) @(Contact.point &c) (Vector3.mul (Contact.normal &c) -1.0)))
+                                        (Maybe.Nothing) (Maybe.Nothing)))
+            (Volume.Ball s1)
+                (match @v2
+                    (Volume.Box b2) (Sphere.collide-aabb &s1 &b2)
+                    (Volume.Ball s2) (Sphere.collide-sphere &s1 &s2))))
+)
+
+(defmodule CollisionChecker
+    (doc check-pair "tests two collidables for intersection, respecting layers and masks.")
+    (defn check-pair [c1 c2]
+        (if (or (Handle.equal? (Collidable.handle c1) (Collidable.handle c2))
+                (= (Uint32.bit-and @(Collidable.mask c1) @(Collidable.layer c2)) (the Uint32 (zero))))
+            (Maybe.Nothing)
+            (match (Collision.collide (Collidable.volume c1) (Collidable.volume c2))
+                (Maybe.Just contact) (Maybe.Just (Collision.init @(Collidable.handle c1) @(Collidable.handle c2) contact))
+                (Maybe.Nothing) (Maybe.Nothing))))
+
+    (doc query-and-check "queries the spatial grid for candidates and performs narrow-phase checks.")
+    (defn query-and-check [grid self others]
+        (let [aabb (Collision.get-aabb (Collidable.volume self))
+              candidates (SpatialGrid.query-unique grid &aabb)
+              results []]
+          (do
+            (for [i 0 (Array.length &candidates)]
+                (let [other-idx (Uint64.to-int @(Array.unsafe-nth &candidates i))]
+                    (if (< other-idx (Array.length others))
+                        (let [other (Array.unsafe-nth others other-idx)]
+                            (match (check-pair self other)
+                                (Maybe.Just col) (Array.push-back! &results col)
+                                (Maybe.Nothing) ()))
+                        ())))
+            results)))
+)
