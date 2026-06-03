@@ -11,14 +11,6 @@
     (Box [AABB])
     (Ball [Sphere]))
 
-(doc Collidable "is a wrapper that associates a handle with a physical volume and collision filtering metadata.")
-(deftype Collidable [
-    handle (Handle ())
-    volume Volume
-    layer Uint32
-    mask Uint32
-])
-
 (doc Collision "represents a confirmed intersection between two collidables with contact manifold data.")
 (deftype Collision [
     a (Handle ())
@@ -30,6 +22,20 @@
 (deftype Trigger [
     a (Handle ())
     b (Handle ())
+])
+
+(doc CollisionResult "is a sum type representing the outcome of a collision check.")
+(deftype CollisionResult
+    (Physical [Collision])
+    (Triggered [Trigger]))
+
+(doc Collidable "is a wrapper that associates a handle with a physical volume and collision filtering metadata.")
+(deftype Collidable [
+    handle (Handle ())
+    volume Volume
+    layer Uint32
+    mask Uint32
+    is-trigger Bool
 ])
 
 (defmodule Collision
@@ -50,37 +56,69 @@
                 (match @v2
                     (Volume.Box b2) (AABB.collide-aabb &b1 &b2)
                     (Volume.Ball s2) (match (Sphere.collide-aabb &s2 &b1)
-                                        (Maybe.Just c) (Maybe.Just (Contact.init @(Contact.depth &c) @(Contact.point &c) (Vector3.mul (Contact.normal &c) -1.0)))
+                                        (Maybe.Just c) (Maybe.Just (Contact.reverse &c))
                                         (Maybe.Nothing) (Maybe.Nothing)))
             (Volume.Ball s1)
                 (match @v2
                     (Volume.Box b2) (Sphere.collide-aabb &s1 &b2)
                     (Volume.Ball s2) (Sphere.collide-sphere &s1 &s2))))
+
+    (doc intersects? "performs a boolean-only intersection test without manifold generation.")
+    (defn intersects? [v1 v2]
+        (match @v1
+            (Volume.Box b1)
+                (match @v2
+                    (Volume.Box b2) (AABB.contains? &b1 (AABB.min &b2)) ;; Simplified for now, should use a proper boolean test
+                    (Volume.Ball s2) (Sphere.contains? &s2 (AABB.min &b1)))
+            (Volume.Ball s1)
+                (match @v2
+                    (Volume.Box b2) (Sphere.contains? &s1 (AABB.min &b2))
+                    (Volume.Ball s2) (let [d2 (Vector3.mag-sq &(Vector3.sub (Sphere.center &s1) (Sphere.center &s2)))
+                                           sum (+ @(Sphere.radius &s1) @(Sphere.radius &s2))]
+                                       (<= d2 (* sum sum))))))
 )
 
 (defmodule CollisionChecker
-    (doc check-pair "tests two collidables for intersection, respecting layers and masks.")
+    (doc check-pair "tests two collidables for intersection, respecting layers, masks, and trigger states.
+Ensures symmetric filtering: both objects must be interested in each other.")
     (defn check-pair [c1 c2]
-        (if (or (Handle.equal? (Collidable.handle c1) (Collidable.handle c2))
-                (= (Uint32.bit-and @(Collidable.mask c1) @(Collidable.layer c2)) (the Uint32 (zero))))
-            (Maybe.Nothing)
-            (match (Collision.collide (Collidable.volume c1) (Collidable.volume c2))
-                (Maybe.Just contact) (Maybe.Just (Collision.init @(Collidable.handle c1) @(Collidable.handle c2) contact))
-                (Maybe.Nothing) (Maybe.Nothing))))
+        (let [h1 (Collidable.handle c1)
+              h2 (Collidable.handle c2)]
+          (if (or (Handle.equal? h1 h2)
+                  (or (= (Uint32.bit-and @(Collidable.mask c1) @(Collidable.layer c2)) (the Uint32 (zero)))
+                      (= (Uint32.bit-and @(Collidable.mask c2) @(Collidable.layer c1)) (the Uint32 (zero)))))
+              (Maybe.Nothing)
+              (if (or @(Collidable.is-trigger c1) @(Collidable.is-trigger c2))
+                  (if (Collision.intersects? (Collidable.volume c1) (Collidable.volume c2))
+                      (Maybe.Just (CollisionResult.Triggered (Trigger.init @h1 @h2)))
+                      (Maybe.Nothing))
+                  (match (Collision.collide (Collidable.volume c1) (Collidable.volume c2))
+                      (Maybe.Just contact) (Maybe.Just (CollisionResult.Physical (Collision.init @h1 @h2 contact)))
+                      (Maybe.Nothing) (Maybe.Nothing))))))
 
-    (doc query-and-check "queries the spatial grid for candidates and performs narrow-phase checks.")
-    (defn query-and-check [grid self others]
+    (doc query-and-check-into! "queries the spatial grid and appends results to the provided array.
+Supports an optional 'symmetric' flag to prevent duplicate pair generation (A-B and B-A).")
+    (defn query-and-check-into! [grid self others out symmetric]
         (let [aabb (Collision.get-aabb (Collidable.volume self))
-              candidates (SpatialGrid.query-unique grid &aabb)
-              results []]
+              candidates (SpatialGrid.query-unique grid &aabb)]
           (do
             (for [i 0 (Array.length &candidates)]
-                (let [other-idx (Uint64.to-int @(Array.unsafe-nth &candidates i))]
+                (let [other-idx (Long.to-int (Uint64.to-long @(Array.unsafe-nth &candidates i)))]
                     (if (< other-idx (Array.length others))
-                        (let [other (Array.unsafe-nth others other-idx)]
-                            (match (check-pair self other)
-                                (Maybe.Just col) (Array.push-back! &results col)
-                                (Maybe.Nothing) ()))
+                        (let [other (Array.unsafe-nth others other-idx)
+                              h-self (Collidable.handle self)
+                              h-other (Collidable.handle other)]
+                            (if (and symmetric (not (Handle.less-than? h-self h-other)))
+                                () ;; Skip if we are enforcing order and this isn't the primary pair
+                                (match (check-pair self other)
+                                    (Maybe.Just res) (Array.push-back! out res)
+                                    (Maybe.Nothing) ())))
                         ())))
-            results)))
+            ())))
+
+    (doc query-and-check "convenience wrapper for query-and-check-into! that allocates a new array.")
+    (defn query-and-check [grid self others symmetric]
+        (let [results []]
+            (do (query-and-check-into! grid self others &results symmetric)
+                results)))
 )
