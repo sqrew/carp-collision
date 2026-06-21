@@ -1,7 +1,6 @@
 (load "../carp-geometry/geometry.carp")
 (load "../carp-handle/handle.carp")
 (load "../carp-spatial/grid.carp")
-
 (use Geometry)
 (use Handle)
 (use SpatialGrid)
@@ -9,14 +8,388 @@
 (doc Volume "is a sum type (variant) for geometric shapes supported by the collision system.")
 (deftype Volume
     (Box [AABB])
-    (Ball [Sphere]))
+    (Ball [Sphere])
+    (Surface [Plane])
+    (Sdf [SDF]))
 
 (doc Collision "represents a confirmed intersection between two collidables with contact manifold data.")
 (deftype Collision [
-    a (Handle ())
-    b (Handle ())
-    contact Contact
+    contact-set ContactSet
 ])
+
+(defmodule Collision
+    (defn a [c] (ContactSet.a (Collision.contact-set c)))
+    (defn b [c] (ContactSet.b (Collision.contact-set c)))
+
+    (doc get-aabb "calculates the axis-aligned bounding box for any supported volume.")
+    (defn get-aabb [v]
+        (match @v
+            (Volume.Box b) b
+            (Volume.Ball s) 
+                (let [center (Sphere.center &s)
+                      r @(Sphere.radius &s)]
+                  (AABB.init (Vector3.sub center &(Vector3.init r r r))
+                             (Vector3.add center &(Vector3.init r r r))))
+            (Volume.Surface p)
+                ;; Plane is infinite, so we return a very large but finite AABB
+                (AABB.init (Vector3.init -1000.0 -1000.0 -1000.0)
+                           (Vector3.init 1000.0 1000.0 1000.0))
+            (Volume.Sdf sdf)
+                (let [scale @(SDF.scale &sdf)]
+                  (match-ref (SDF.base &sdf)
+                      (BaseShape.Ball r)
+                          (let [pos (SDF.position &sdf)
+                                sr (* @r scale)]
+                              (AABB.init (Vector3.sub pos &(Vector3.init sr sr sr))
+                                         (Vector3.add pos &(Vector3.init sr sr sr))))
+                      (BaseShape.Surface pl)
+                          (AABB.init (Vector3.init -1000.0 -1000.0 -1000.0)
+                                     (Vector3.init 1000.0 1000.0 1000.0))
+                      (BaseShape.Box e)
+                          (let [pos (SDF.position &sdf)
+                                r (* (Vector3.mag e) scale)]
+                              (AABB.init (Vector3.sub pos &(Vector3.init r r r))
+                                         (Vector3.add pos &(Vector3.init r r r))))
+                      (BaseShape.Cylinder rad hh)
+                          (let [pos (SDF.position &sdf)
+                                r (* (sqrt (+ (* @rad @rad) (* @hh @hh))) scale)]
+                              (AABB.init (Vector3.sub pos &(Vector3.init r r r))
+                                         (Vector3.add pos &(Vector3.init r r r))))
+                      (BaseShape.Capsule rad hh)
+                          (let [pos (SDF.position &sdf)
+                                r (* (+ @rad @hh) scale)]
+                              (AABB.init (Vector3.sub pos &(Vector3.init r r r))
+                                         (Vector3.add pos &(Vector3.init r r r))))
+                      (BaseShape.Torus rad-maj rad-min)
+                          (let [pos (SDF.position &sdf)
+                                rt (* (+ @rad-maj @rad-min) scale)]
+                              (AABB.init (Vector3.sub pos &(Vector3.init rt rt rt))
+                                         (Vector3.add pos &(Vector3.init rt rt rt))))
+                      (BaseShape.Octahedron s)
+                          (let [pos (SDF.position &sdf)
+                                rt (* @s scale)]
+                              (AABB.init (Vector3.sub pos &(Vector3.init rt rt rt))
+                                         (Vector3.add pos &(Vector3.init rt rt rt))))))))
+
+    (doc get-swept-aabb "calculates an AABB that encompasses both the current position and the predicted next position based on velocity and dt.")
+    (defn get-swept-aabb [v vel dt]
+        (let [aabb (Collision.get-aabb v)
+              min-pt (AABB.min &aabb)
+              max-pt (AABB.max &aabb)
+              delta (Vector3.mul vel dt)]
+          (AABB.init 
+            (Vector3.init (min @(Vector3.x min-pt) (+ @(Vector3.x min-pt) @(Vector3.x &delta)))
+                          (min @(Vector3.y min-pt) (+ @(Vector3.y min-pt) @(Vector3.y &delta)))
+                          (min @(Vector3.z min-pt) (+ @(Vector3.z min-pt) @(Vector3.z &delta))))
+            (Vector3.init (max @(Vector3.x max-pt) (+ @(Vector3.x max-pt) @(Vector3.x &delta)))
+                          (max @(Vector3.y max-pt) (+ @(Vector3.y max-pt) @(Vector3.y &delta)))
+                          (max @(Vector3.z max-pt) (+ @(Vector3.z max-pt) @(Vector3.z &delta)))))))
+
+    (sig get-sdf-radius (Fn [(Ref SDF)] Double))
+    (sig collide-sdf-plane (Fn [(Ref Handle), (Ref SDF), (Ref Handle), (Ref Plane)] (Maybe ContactSet)))
+    (sig collide-sdf-sdf (Fn [(Ref Handle), (Ref SDF), (Ref Handle), (Ref SDF)] (Maybe ContactSet)))
+    (sig collide-box-sdf (Fn [(Ref Handle), (Ref AABB), (Ref Handle), (Ref SDF)] (Maybe ContactSet)))
+
+    (defn collide-sdf-plane [h-sdf sdf h-plane plane]
+      (let [pos (SDF.position sdf)
+            plane-norm @(Plane.normal plane)
+            r (get-sdf-radius sdf)
+            p (Vector3.sub pos &(Vector3.mul &plane-norm r))]
+        (do
+          (for [iter 0 5]
+            (let [d (SDF.distance-world sdf &p)
+                  n (SDF.normal-world sdf &p)]
+              (set! p (Vector3.sub &p &(Vector3.mul &n d)))))
+          (let [plane-dist (Plane.distance-to-point plane &p)]
+            (if (< plane-dist 0.0)
+                (Maybe.Just (ContactSet.init @h-sdf @h-plane [(Contact.init (neg plane-dist) p plane-norm)]))
+                (Maybe.Nothing))))))
+
+    (defn get-sdf-radius [sdf]
+      (let [scale @(SDF.scale sdf)]
+        (match @(SDF.base sdf)
+          (BaseShape.Ball r) (* r scale)
+          (BaseShape.Box e) (* (Vector3.mag &e) scale)
+          (BaseShape.Cylinder rad hh) (* (sqrt (+ (* rad rad) (* hh hh))) scale)
+          (BaseShape.Capsule rad hh) (* (+ rad hh) scale)
+          (BaseShape.Torus rad-maj rad-min) (* (+ rad-maj rad-min) scale)
+          (BaseShape.Octahedron s) (* s scale)
+          _ 0.0)))
+
+    (defn sample-sdf-features! [contacts sdf-a sdf-b flip-normal]
+      (let [pos (SDF.position sdf-a)
+            rot (SDF.rotation sdf-a)
+            scale-a @(SDF.scale sdf-a)
+            pos-b (SDF.position sdf-b)
+            dir (if flip-normal
+                    (Vector3.sub pos-b pos)
+                    (Vector3.sub pos pos-b))
+            offsets []
+            radius 0.0]
+        (do
+          (match-ref (SDF.base sdf-a)
+            (BaseShape.Ball r)
+              (do
+                (set! radius @r)
+                (Array.push-back! &offsets (Vector3.init 0.0 0.0 0.0)))
+            (BaseShape.Box e)
+              (let [ex @(Vector3.x e)
+                    ey @(Vector3.y e)
+                    ez @(Vector3.z e)]
+                (do
+                  (Array.push-back! &offsets (Vector3.init ex ey ez))
+                  (Array.push-back! &offsets (Vector3.init ex ey (neg ez)))
+                  (Array.push-back! &offsets (Vector3.init ex (neg ey) ez))
+                  (Array.push-back! &offsets (Vector3.init ex (neg ey) (neg ez)))
+                  (Array.push-back! &offsets (Vector3.init (neg ex) ey ez))
+                  (Array.push-back! &offsets (Vector3.init (neg ex) ey (neg ez)))
+                  (Array.push-back! &offsets (Vector3.init (neg ex) (neg ey) ez))
+                  (Array.push-back! &offsets (Vector3.init (neg ex) (neg ey) (neg ez)))))
+            (BaseShape.Cylinder rad hh)
+              (let [rad-val @rad
+                    hh-val @hh]
+                (do
+                  (Array.push-back! &offsets (Vector3.init 0.0 hh-val 0.0))
+                  (Array.push-back! &offsets (Vector3.init 0.0 (neg hh-val) 0.0))
+                  (for [i 0 8]
+                    (let [theta (* (Double.from-int i) (/ 6.283185307179586 8.0))
+                          c (cos theta)
+                          s (sin theta)]
+                      (do
+                        (Array.push-back! &offsets (Vector3.init (* rad-val c) hh-val (* rad-val s)))
+                        (Array.push-back! &offsets (Vector3.init (* rad-val c) (neg hh-val) (* rad-val s))))))))
+            (BaseShape.Capsule rad hh)
+              (do
+                (set! radius @rad)
+                (Array.push-back! &offsets (Vector3.init 0.0 @hh 0.0))
+                (Array.push-back! &offsets (Vector3.init 0.0 (neg @hh) 0.0)))
+            (BaseShape.Torus rad-maj rad-min)
+              (let [rmaj @rad-maj]
+                (do
+                  (set! radius @rad-min)
+                  (for [i 0 8]
+                    (let [theta (* (Double.from-int i) (/ 6.283185307179586 8.0))
+                          c (cos theta)
+                          s (sin theta)]
+                      (Array.push-back! &offsets (Vector3.init (* rmaj c) 0.0 (* rmaj s)))))))
+            (BaseShape.Octahedron s)
+              (let [size @s]
+                (do
+                  (Array.push-back! &offsets (Vector3.init size 0.0 0.0))
+                  (Array.push-back! &offsets (Vector3.init (neg size) 0.0 0.0))
+                  (Array.push-back! &offsets (Vector3.init 0.0 size 0.0))
+                  (Array.push-back! &offsets (Vector3.init 0.0 (neg size) 0.0))
+                  (Array.push-back! &offsets (Vector3.init 0.0 0.0 size))
+                  (Array.push-back! &offsets (Vector3.init 0.0 0.0 (neg size)))))
+            _ ())
+          (for [i 0 (Array.length &offsets)]
+            (let [offset (Array.unsafe-nth &offsets i)
+                  v (Vector3.add pos &(Vector3.mul &(Quaternion.rotate rot offset) scale-a))
+                  d (SDF.distance-world sdf-b &v)]
+              (when (< d (* radius scale-a))
+                (let [depth (- (* radius scale-a) d)
+                      raw-norm (SDF.normal-world sdf-b &v)
+                      v-contact (if (> radius 0.0)
+                                    (let [scaled-offset (Vector3.mul &raw-norm (* radius scale-a))]
+                                      (Vector3.sub &v &scaled-offset))
+                                    @&v)
+                      norm (if flip-normal (Vector3.mul &raw-norm -1.0) raw-norm)
+                      norm-corrected (if (< (Vector3.dot &norm &dir) 0.0)
+                                         (Vector3.mul &norm -1.0)
+                                         norm)
+                      too-close false]
+                  (do
+                    (for [j 0 (Array.length contacts)]
+                      (when (< (Vector3.dist &v-contact (Contact.point (Array.unsafe-nth contacts j))) 0.05)
+                        (set! too-close true)))
+                    (when (not too-close)
+                      (Array.push-back! contacts (Contact.init depth v-contact norm-corrected))))))))
+          (for [i 0 (Array.length &offsets)]
+            (Vector3.delete @(Array.unsafe-nth &offsets i))))))
+
+    (defn collide-sdf-sdf [h1 sdf1 h2 sdf2]
+      (match @(SDF.base sdf1)
+        (BaseShape.Surface plane1)
+          (match @(SDF.base sdf2)
+            (BaseShape.Surface plane2)
+              (Maybe.Nothing)
+            _
+              (match (collide-sdf-plane h2 sdf2 h1 &plane1)
+                (Maybe.Just cs) (Maybe.Just (ContactSet.reverse &cs))
+                (Maybe.Nothing) (Maybe.Nothing)))
+        _
+          (match @(SDF.base sdf2)
+            (BaseShape.Surface plane2)
+              (collide-sdf-plane h1 sdf1 h2 &plane2)
+            _
+              (let [contacts []]
+                (do
+                  (sample-sdf-features! &contacts sdf1 sdf2 false)
+                  (sample-sdf-features! &contacts sdf2 sdf1 true)
+                  (if (Array.empty? &contacts)
+                      (Maybe.Nothing)
+                      (Maybe.Just (ContactSet.init @h1 @h2 contacts))))))))
+
+    (defn collide-box-sdf [h-box box h-sdf sdf]
+      (let [min-pt (AABB.min box)
+            max-pt (AABB.max box)
+            center (Vector3.mul &(Vector3.add min-pt max-pt) 0.5)
+            e (Vector3.mul &(Vector3.sub max-pt min-pt) 0.5)
+            ex @(Vector3.x &e)
+            ey @(Vector3.y &e)
+            ez @(Vector3.z &e)
+            cx @(Vector3.x &center)
+            cy @(Vector3.y &center)
+            cz @(Vector3.z &center)
+            contacts []]
+        (do
+          ;; 1. Sample 8 corners of the box
+          (let [offsets [
+                  (Vector3.init ex ey ez)
+                  (Vector3.init ex ey (neg ez))
+                  (Vector3.init ex (neg ey) ez)
+                  (Vector3.init ex (neg ey) (neg ez))
+                  (Vector3.init (neg ex) ey ez)
+                  (Vector3.init (neg ex) ey (neg ez))
+                  (Vector3.init (neg ex) (neg ey) ez)
+                  (Vector3.init (neg ex) (neg ey) (neg ez))
+                ]]
+            (do
+              (for [i 0 8]
+                (let [offset (Array.unsafe-nth &offsets i)
+                      v (Vector3.add &center offset)
+                      d (SDF.distance-world sdf &v)]
+                  (when (< d 0.0)
+                    (let [depth (neg d)
+                          norm (SDF.normal-world sdf &v)]
+                      (Array.push-back! &contacts (Contact.init depth v norm))))))
+              ;; Clean up offsets array contents
+              (for [i 0 8]
+                (Vector3.delete @(Array.unsafe-nth &offsets i)))))
+
+          ;; 2. Run projection check to catch face/edge features (e.g. resting on dynamic terrain peak)
+          (let [n (SDF.normal-world sdf &center)
+                r (+ (* ex (abs @(Vector3.x &n)))
+                     (+ (* ey (abs @(Vector3.y &n)))
+                        (* ez (abs @(Vector3.z &n)))))
+                p (Vector3.sub &center &(Vector3.mul &n r))]
+            (do
+              (for [iter 0 3]
+                (let [d (SDF.distance-world sdf &p)
+                      curr-n (SDF.normal-world sdf &p)]
+                  (set! p (Vector3.sub &p &(Vector3.mul &curr-n d)))))
+              (let [dx (abs (- @(Vector3.x &p) cx))
+                    dy (abs (- @(Vector3.y &p) cy))
+                    dz (abs (- @(Vector3.z &p) cz))]
+                (when (and (< dx ex) (and (< dy ey) (< dz ez)))
+                  (let [depth (min (- ex dx) (min (- ey dy) (- ez dz)))
+                        norm (SDF.normal-world sdf &p)]
+                    (let [too-close false]
+                      (do
+                        (for [j 0 (Array.length &contacts)]
+                          (when (< (Vector3.dist &p (Contact.point (Array.unsafe-nth &contacts j))) 0.05)
+                            (set! too-close true)))
+                        (when (not too-close)
+                          (Array.push-back! &contacts (Contact.init depth p norm))))))))))
+
+          (if (Array.empty? &contacts)
+              (Maybe.Nothing)
+              (Maybe.Just (ContactSet.init @h-box @h-sdf contacts))))))
+
+    (defn collide [h1 v1 h2 v2]
+        (match-ref v1
+            (Volume.Box b1)
+                (match-ref v2
+                    (Volume.Box b2) 
+                        (match (AABB.collide-aabb b1 b2)
+                            (Maybe.Just c) (Maybe.Just (ContactSet.init @h1 @h2 [c]))
+                            (Maybe.Nothing) (Maybe.Nothing))
+                    (Volume.Ball s2) 
+                        (match (Sphere.collide-aabb s2 b1)
+                            (Maybe.Just c) (Maybe.Just (ContactSet.reverse &(ContactSet.init @h2 @h1 [c])))
+                            (Maybe.Nothing) (Maybe.Nothing))
+                    (Volume.Sdf sdf2)
+                        (match (Collision.collide-box-sdf h1 b1 h2 sdf2)
+                            (Maybe.Just cs) (Maybe.Just cs)
+                            (Maybe.Nothing) (Maybe.Nothing))
+                    _ (Maybe.Nothing))
+            (Volume.Ball s1)
+                (match-ref v2
+                    (Volume.Box b2)
+                        (match (Sphere.collide-aabb s1 b2)
+                            (Maybe.Just c) (Maybe.Just (ContactSet.init @h1 @h2 [c]))
+                            (Maybe.Nothing) (Maybe.Nothing))
+                    (Volume.Ball s2)
+                        (match (Sphere.collide-sphere s1 s2)
+                            (Maybe.Just c) (Maybe.Just (ContactSet.init @h1 @h2 [c]))
+                            (Maybe.Nothing) (Maybe.Nothing))
+                    (Volume.Surface p2) 
+                        (let [dist (Plane.distance-to-point p2 (Sphere.center s1))
+                                r @(Sphere.radius s1)]
+                          (if (<= dist r)
+                              (Maybe.Just (ContactSet.init @h1 @h2 
+                                  [(Contact.init (- r dist) 
+                                                (Plane.project-point p2 (Sphere.center s1))
+                                                @(Plane.normal p2))]))
+                              (Maybe.Nothing)))
+                    (Volume.Sdf sdf)
+                        (match (Sphere.collide-sdf s1 sdf)
+                            (Maybe.Just c) (Maybe.Just (ContactSet.init @h1 @h2 [c]))
+                            (Maybe.Nothing) (Maybe.Nothing)))
+            (Volume.Surface p1)
+                (match-ref v2
+                    (Volume.Ball s2)
+                        (match (collide h2 v2 h1 v1)
+                            (Maybe.Just cs) (Maybe.Just (ContactSet.reverse &cs))
+                            (Maybe.Nothing) (Maybe.Nothing))
+                    (Volume.Sdf sdf2)
+                        (match (Collision.collide-sdf-plane h2 sdf2 h1 p1)
+                            (Maybe.Just cs) (Maybe.Just (ContactSet.reverse &cs))
+                            (Maybe.Nothing) (Maybe.Nothing))
+                    _ (Maybe.Nothing))
+            (Volume.Sdf sdf)
+                (match-ref v2
+                    (Volume.Box b2)
+                        (match (Collision.collide-box-sdf h2 b2 h1 sdf)
+                            (Maybe.Just cs) (Maybe.Just (ContactSet.reverse &cs))
+                            (Maybe.Nothing) (Maybe.Nothing))
+                    (Volume.Ball s2)
+                        (match (collide h2 v2 h1 v1)
+                            (Maybe.Just cs) (Maybe.Just (ContactSet.reverse &cs))
+                            (Maybe.Nothing) (Maybe.Nothing))
+                    (Volume.Surface p2)
+                        (match (Collision.collide-sdf-plane h1 sdf h2 p2)
+                            (Maybe.Just cs) (Maybe.Just cs)
+                            (Maybe.Nothing) (Maybe.Nothing))
+                    (Volume.Sdf sdf2)
+                        (match (Collision.collide-sdf-sdf h1 sdf h2 sdf2)
+                            (Maybe.Just cs) (Maybe.Just cs)
+                            (Maybe.Nothing) (Maybe.Nothing))
+                    _ (Maybe.Nothing))))
+
+    (doc collide-swept "Checks if a moving volume v1 (with velocity vel and dt) hits v2.")
+    (defn collide-swept [h1 v1 vel dt h2 v2]
+        (match-ref v1
+            (Volume.Ball s1)
+                (match-ref v2
+                    (Volume.Surface p2)
+                        (let [start @(Sphere.center s1)
+                              end (Vector3.add &start &(Vector3.mul vel dt))
+                              dist-start (Plane.distance-to-point p2 &start)
+                              dist-end (Plane.distance-to-point p2 &end)
+                              r @(Sphere.radius s1)]
+                          ;; If we crossed the plane + radius threshold
+                          (if (and (> dist-start r) (<= dist-end r))
+                              ;; Tunneling detected! Return a contact that pushes back to the threshold
+                              (let [depth (- r dist-end)
+                                    norm @(Plane.normal p2)
+                                    c (Contact.init depth end norm)]
+                                (Maybe.Just (ContactSet.init @h1 @h2 [c])))
+                              ;; Otherwise just do the normal check
+                              (collide h1 v1 h2 v2)))
+                    _ (collide h1 v1 h2 v2))
+            _ (collide h1 v1 h2 v2)))
+)
 
 (doc Trigger "represents a confirmed intersection without contact data, useful for sensors and triggers.")
 (deftype Trigger [
@@ -52,35 +425,8 @@
     is-trigger Bool
 ])
 
-(defmodule Collision
-    (doc get-aabb "calculates the axis-aligned bounding box for any supported volume.")
-    (defn get-aabb [v]
-        (match @v
-            (Volume.Box b) b
-            (Volume.Ball s) 
-                (let [center (Sphere.center &s)
-                      r @(Sphere.radius &s)]
-                  (AABB.init (Vector3.sub center &(Vector3.init r r r))
-                             (Vector3.add center &(Vector3.init r r r))))))
-
-    (doc collide "dispatches to the correct narrow-phase geometry test based on volume types.")
-    (defn collide [v1 v2]
-        (match @v1
-            (Volume.Box b1)
-                (match @v2
-                    (Volume.Box b2) (AABB.collide-aabb &b1 &b2)
-                    (Volume.Ball s2) (match (Sphere.collide-aabb &s2 &b1)
-                                        (Maybe.Just c) (Maybe.Just (Contact.reverse &c))
-                                        (Maybe.Nothing) (Maybe.Nothing)))
-            (Volume.Ball s1)
-                (match @v2
-                    (Volume.Box b2) (Sphere.collide-aabb &s1 &b2)
-                    (Volume.Ball s2) (Sphere.collide-sphere &s1 &s2))))
-)
-
 (defmodule CollisionChecker
-    (doc check-pair "tests two collidables for intersection, respecting layers, masks, and trigger states.
-Ensures symmetric filtering: both objects must be interested in each other.")
+    (doc check-pair "tests two collidables for intersection, respecting layers, masks, and trigger states.")
     (defn check-pair [c1 c2]
         (let [h1 (Collidable.handle c1)
               h2 (Collidable.handle c2)]
@@ -88,15 +434,29 @@ Ensures symmetric filtering: both objects must be interested in each other.")
                   (or (= (Uint32.bit-and @(Collidable.mask c1) @(Collidable.layer c2)) (the Uint32 (zero)))
                       (= (Uint32.bit-and @(Collidable.mask c2) @(Collidable.layer c1)) (the Uint32 (zero)))))
               (Maybe.Nothing)
-              (match (Collision.collide (Collidable.volume c1) (Collidable.volume c2))
+              (match (Collision.collide h1 (Collidable.volume c1) h2 (Collidable.volume c2))
                 (Maybe.Nothing) (Maybe.Nothing)
-                (Maybe.Just contact)
+                (Maybe.Just contact-set)
                   (if (or @(Collidable.is-trigger c1) @(Collidable.is-trigger c2))
                       (Maybe.Just (CollisionResult.Triggered (Trigger.init @h1 @h2)))
-                      (Maybe.Just (CollisionResult.Physical (Collision.init @h1 @h2 contact))))))))
+                      (Maybe.Just (CollisionResult.Physical (Collision.init contact-set))))))))
 
-    (doc query-and-check-into! "queries the spatial grid and appends results to the provided array.
-Supports an optional 'symmetric' flag to prevent duplicate pair generation (A-B and B-A).")
+    (doc check-pair-swept "Continuous Collision Detection (CCD) version of check-pair.")
+    (defn check-pair-swept [c1 vel dt c2]
+        (let [h1 (Collidable.handle c1)
+              h2 (Collidable.handle c2)]
+          (if (or (Handle.equal? h1 h2)
+                  (or (= (Uint32.bit-and @(Collidable.mask c1) @(Collidable.layer c2)) (the Uint32 (zero)))
+                      (= (Uint32.bit-and @(Collidable.mask c2) @(Collidable.layer c1)) (the Uint32 (zero)))))
+              (Maybe.Nothing)
+              (match (Collision.collide-swept h1 (Collidable.volume c1) vel dt h2 (Collidable.volume c2))
+                (Maybe.Nothing) (Maybe.Nothing)
+                (Maybe.Just contact-set)
+                  (if (or @(Collidable.is-trigger c1) @(Collidable.is-trigger c2))
+                      (Maybe.Just (CollisionResult.Triggered (Trigger.init @h1 @h2)))
+                      (Maybe.Just (CollisionResult.Physical (Collision.init contact-set))))))))
+
+    (doc query-and-check-into! "queries the spatial grid and appends results to the provided array.")
     (defn query-and-check-into! [grid self others out symmetric]
         (let [aabb (Collision.get-aabb (Collidable.volume self))
               candidates (SpatialGrid.query-unique grid &aabb)]
