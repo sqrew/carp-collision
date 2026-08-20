@@ -20,6 +20,8 @@
 (defmodule Collision
     (defn a [c] (ContactSet.a (Collision.contact-set c)))
     (defn b [c] (ContactSet.b (Collision.contact-set c)))
+    (defn contact [c]
+      (Array.unsafe-nth (ContactSet.contacts (Collision.contact-set c)) 0))
 
     (doc get-aabb "calculates the axis-aligned bounding box for any supported volume.")
     (defn get-aabb [v]
@@ -89,6 +91,10 @@
     (sig collide-sdf-plane (Fn [(Ref Handle), (Ref SDF), (Ref Handle), (Ref Plane)] (Maybe ContactSet)))
     (sig collide-sdf-sdf (Fn [(Ref Handle), (Ref SDF), (Ref Handle), (Ref SDF)] (Maybe ContactSet)))
     (sig collide-box-sdf (Fn [(Ref Handle), (Ref AABB), (Ref Handle), (Ref SDF)] (Maybe ContactSet)))
+    (sig collide-sdf-generic (Fn [(Ref Handle), (Ref SDF), (Ref Handle), (Ref SDF)] (Maybe ContactSet)))
+    (sig collide-sdf-ball-ball (Fn [(Ref Handle), (Ref SDF), Double, (Ref Handle), (Ref SDF), Double] (Maybe ContactSet)))
+    (sig collide-sdf-ball-box (Fn [(Ref Handle), (Ref SDF), Double, (Ref Handle), (Ref SDF), (Ref (Vector3 Double))] (Maybe ContactSet)))
+    (sig collide-sdf-box-box (Fn [(Ref Handle), (Ref SDF), (Ref (Vector3 Double)), (Ref Handle), (Ref SDF), (Ref (Vector3 Double))] (Maybe ContactSet)))
 
     (defn collide-sdf-plane [h-sdf sdf h-plane plane]
       (let [pos (SDF.position sdf)
@@ -115,6 +121,30 @@
           (BaseShape.Torus rad-maj rad-min) (* (+ rad-maj rad-min) scale)
           (BaseShape.Octahedron s) (* s scale)
           _ 0.0)))
+    (defn sample-offset-internal! [contacts sdf-a sdf-b flip-normal pos rot scale-a radius offset dir]
+      (let [v (Vector3.add pos &(Vector3.mul &(Quaternion.rotate rot offset) scale-a))
+            d (SDF.distance-world sdf-b &v)
+            da (SDF.distance-world sdf-a &v)]
+        (do
+          (when (and (< d (* radius scale-a))
+                     (<= da 0.01))
+            (let [depth (- (* radius scale-a) d)
+                  raw-norm (SDF.normal-world sdf-b &v)
+                  norm (if flip-normal (Vector3.mul &raw-norm -1.0) raw-norm)
+                  norm-corrected (if (< (Vector3.dot &norm dir) 0.0)
+                                     (Vector3.mul &norm -1.0)
+                                     norm)
+                  v-contact (if (> radius 0.0)
+                                (let [scaled-offset (Vector3.mul &norm-corrected (* radius scale-a))]
+                                  (Vector3.sub &v &scaled-offset))
+                                @&v)
+                  too-close false]
+              (do
+                (for [j 0 (Array.length contacts)]
+                  (when (< (Vector3.dist &v-contact (Contact.point (Array.unsafe-nth contacts j))) 0.05)
+                    (set! too-close true)))
+                (when (not too-close)
+                  (Array.push-back! contacts (Contact.init depth v-contact norm-corrected)))))))))
 
     (defn sample-sdf-features! [contacts sdf-a sdf-b flip-normal]
       (let [pos (SDF.position sdf-a)
@@ -123,112 +153,504 @@
             pos-b (SDF.position sdf-b)
             dir (if flip-normal
                     (Vector3.sub pos-b pos)
-                    (Vector3.sub pos pos-b))
-            offsets []
-            radius 0.0]
+                    (Vector3.sub pos pos-b))]
         (do
           (match-ref (SDF.base sdf-a)
             (BaseShape.Ball r)
-              (do
-                (set! radius @r)
-                (Array.push-back! &offsets (Vector3.init 0.0 0.0 0.0)))
+              (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a @r &(Vector3.init 0.0 0.0 0.0) &dir)
             (BaseShape.Box e)
               (let [ex @(Vector3.x e)
                     ey @(Vector3.y e)
                     ez @(Vector3.z e)]
                 (do
-                  (Array.push-back! &offsets (Vector3.init ex ey ez))
-                  (Array.push-back! &offsets (Vector3.init ex ey (neg ez)))
-                  (Array.push-back! &offsets (Vector3.init ex (neg ey) ez))
-                  (Array.push-back! &offsets (Vector3.init ex (neg ey) (neg ez)))
-                  (Array.push-back! &offsets (Vector3.init (neg ex) ey ez))
-                  (Array.push-back! &offsets (Vector3.init (neg ex) ey (neg ez)))
-                  (Array.push-back! &offsets (Vector3.init (neg ex) (neg ey) ez))
-                  (Array.push-back! &offsets (Vector3.init (neg ex) (neg ey) (neg ez)))))
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init ex ey ez) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init ex ey (neg ez)) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init ex (neg ey) ez) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init ex (neg ey) (neg ez)) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init (neg ex) ey ez) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init (neg ex) ey (neg ez)) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init (neg ex) (neg ey) ez) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init (neg ex) (neg ey) (neg ez)) &dir)))
             (BaseShape.Cylinder rad hh)
               (let [rad-val @rad
                     hh-val @hh]
                 (do
-                  (Array.push-back! &offsets (Vector3.init 0.0 hh-val 0.0))
-                  (Array.push-back! &offsets (Vector3.init 0.0 (neg hh-val) 0.0))
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init 0.0 hh-val 0.0) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init 0.0 (neg hh-val) 0.0) &dir)
                   (for [i 0 8]
                     (let [theta (* (Double.from-int i) (/ 6.283185307179586 8.0))
                           c (cos theta)
                           s (sin theta)]
                       (do
-                        (Array.push-back! &offsets (Vector3.init (* rad-val c) hh-val (* rad-val s)))
-                        (Array.push-back! &offsets (Vector3.init (* rad-val c) (neg hh-val) (* rad-val s))))))))
+                        (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init (* rad-val c) hh-val (* rad-val s)) &dir)
+                        (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init (* rad-val c) (neg hh-val) (* rad-val s)) &dir))))))
             (BaseShape.Capsule rad hh)
               (do
-                (set! radius @rad)
-                (Array.push-back! &offsets (Vector3.init 0.0 @hh 0.0))
-                (Array.push-back! &offsets (Vector3.init 0.0 (neg @hh) 0.0)))
+                (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a @rad &(Vector3.init 0.0 @hh 0.0) &dir)
+                (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a @rad &(Vector3.init 0.0 (neg @hh) 0.0) &dir))
             (BaseShape.Torus rad-maj rad-min)
-              (let [rmaj @rad-maj]
-                (do
-                  (set! radius @rad-min)
-                  (for [i 0 8]
-                    (let [theta (* (Double.from-int i) (/ 6.283185307179586 8.0))
-                          c (cos theta)
-                          s (sin theta)]
-                      (Array.push-back! &offsets (Vector3.init (* rmaj c) 0.0 (* rmaj s)))))))
+              (let [rmaj @rad-maj
+                    rmin @rad-min]
+                (for [i 0 8]
+                  (let [theta (* (Double.from-int i) (/ 6.283185307179586 8.0))
+                        c (cos theta)
+                        s (sin theta)]
+                    (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a rmin &(Vector3.init (* rmaj c) 0.0 (* rmaj s)) &dir))))
             (BaseShape.Octahedron s)
               (let [size @s]
                 (do
-                  (Array.push-back! &offsets (Vector3.init size 0.0 0.0))
-                  (Array.push-back! &offsets (Vector3.init (neg size) 0.0 0.0))
-                  (Array.push-back! &offsets (Vector3.init 0.0 size 0.0))
-                  (Array.push-back! &offsets (Vector3.init 0.0 (neg size) 0.0))
-                  (Array.push-back! &offsets (Vector3.init 0.0 0.0 size))
-                  (Array.push-back! &offsets (Vector3.init 0.0 0.0 (neg size)))))
-            _ ())
-          (for [i 0 (Array.length &offsets)]
-            (let [offset (Array.unsafe-nth &offsets i)
-                  v (Vector3.add pos &(Vector3.mul &(Quaternion.rotate rot offset) scale-a))
-                  d (SDF.distance-world sdf-b &v)]
-              (when (< d (* radius scale-a))
-                (let [depth (- (* radius scale-a) d)
-                      raw-norm (SDF.normal-world sdf-b &v)
-                      v-contact (if (> radius 0.0)
-                                    (let [scaled-offset (Vector3.mul &raw-norm (* radius scale-a))]
-                                      (Vector3.sub &v &scaled-offset))
-                                    @&v)
-                      norm (if flip-normal (Vector3.mul &raw-norm -1.0) raw-norm)
-                      norm-corrected (if (< (Vector3.dot &norm &dir) 0.0)
-                                         (Vector3.mul &norm -1.0)
-                                         norm)
-                      too-close false]
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init size 0.0 0.0) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init (neg size) 0.0 0.0) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init 0.0 size 0.0) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init 0.0 (neg size) 0.0) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init 0.0 0.0 size) &dir)
+                  (sample-offset-internal! contacts sdf-a sdf-b flip-normal pos rot scale-a 0.0 &(Vector3.init 0.0 0.0 (neg size)) &dir)))
+            _ ()))))
+
+    (defn collide-sdf-generic [h1 sdf1 h2 sdf2]
+      (let [contacts []]
+        (do
+          (sample-sdf-features! &contacts sdf1 sdf2 false)
+          (sample-sdf-features! &contacts sdf2 sdf1 true)
+          (if (Array.empty? &contacts)
+              (Maybe.Nothing)
+              (Maybe.Just (ContactSet.init @h1 @h2 contacts))))))
+
+    (defn collide-sdf-ball-ball [h1 sdf1 r1 h2 sdf2 r2]
+      (let [pos1 (SDF.position sdf1)
+            pos2 (SDF.position sdf2)
+            scale1 @(SDF.scale sdf1)
+            scale2 @(SDF.scale sdf2)
+            rad1 (* r1 scale1)
+            rad2 (* r2 scale2)
+            diff (Vector3.sub pos1 pos2)
+            d2 (Vector3.mag-sq &diff)
+            sum (+ rad1 rad2)]
+        (if (<= d2 (* sum sum))
+          (let [dist (sqrt d2)
+                norm (if (< dist Geometry.EPSILON)
+                         (Vector3.init 0.0 1.0 0.0)
+                         (Vector3.normalize &diff))
+                depth (- sum dist)
+                p (Vector3.sub pos1 &(Vector3.mul &norm rad1))]
+            (Maybe.Just (ContactSet.init @h1 @h2 [(Contact.init depth p norm)])))
+          (Maybe.Nothing))))
+
+    (defn collide-sdf-ball-box [h1 sdf1 r1 h2 sdf2 e2]
+      (let [pos1 (SDF.position sdf1)
+            pos2 (SDF.position sdf2)
+            rot2 (SDF.rotation sdf2)
+            scale2 @(SDF.scale sdf2)
+            half2 (Vector3.mul e2 scale2)
+            local-p (Quaternion.rotate &(Quaternion.inverse rot2) &(Vector3.sub pos1 pos2))
+            closest-local (Vector3.init (clamp (- 0.0 @(Vector3.x &half2)) @(Vector3.x &half2) @(Vector3.x &local-p))
+                                       (clamp (- 0.0 @(Vector3.y &half2)) @(Vector3.y &half2) @(Vector3.y &local-p))
+                                       (clamp (- 0.0 @(Vector3.z &half2)) @(Vector3.z &half2) @(Vector3.z &local-p)))
+            closest-world (Vector3.add pos2 &(Quaternion.rotate rot2 &closest-local))
+            diff (Vector3.sub pos1 &closest-world)
+            d2 (Vector3.mag-sq &diff)
+            rad (* r1 @(SDF.scale sdf1))]
+        (if (<= d2 (* rad rad))
+          (if (< d2 0.000001)
+            ;; Ball center is inside the box
+            (let [lx @(Vector3.x &local-p)
+                  ly @(Vector3.y &local-p)
+                  lz @(Vector3.z &local-p)
+                  hx @(Vector3.x &half2)
+                  hy @(Vector3.y &half2)
+                  hz @(Vector3.z &half2)
+                  dx (- hx (abs lx))
+                  dy (- hy (abs ly))
+                  dz (- hz (abs lz))]
+              (if (and (< dx dy) (< dx dz))
+                (let [sign (if (>= lx 0.0) 1.0 -1.0)
+                      local-normal (Vector3.init sign 0.0 0.0)
+                      norm (Quaternion.rotate rot2 &local-normal)
+                      depth (+ rad dx)
+                      p (Vector3.sub pos1 &(Vector3.mul &norm rad))]
+                  (Maybe.Just (ContactSet.init @h1 @h2 [(Contact.init depth p norm)])))
+                (if (< dy dz)
+                  (let [sign (if (>= ly 0.0) 1.0 -1.0)
+                        local-normal (Vector3.init 0.0 sign 0.0)
+                        norm (Quaternion.rotate rot2 &local-normal)
+                        depth (+ rad dy)
+                        p (Vector3.sub pos1 &(Vector3.mul &norm rad))]
+                    (Maybe.Just (ContactSet.init @h1 @h2 [(Contact.init depth p norm)])))
+                  (let [sign (if (>= lz 0.0) 1.0 -1.0)
+                        local-normal (Vector3.init 0.0 0.0 sign)
+                        norm (Quaternion.rotate rot2 &local-normal)
+                        depth (+ rad dz)
+                        p (Vector3.sub pos1 &(Vector3.mul &norm rad))]
+                    (Maybe.Just (ContactSet.init @h1 @h2 [(Contact.init depth p norm)]))))))
+            ;; Ball center is outside the box
+            (let [dist (sqrt d2)
+                  norm (Vector3.normalize &diff)
+                  depth (- rad dist)
+                  p closest-world]
+              (Maybe.Just (ContactSet.init @h1 @h2 [(Contact.init depth p norm)]))))
+          (Maybe.Nothing))))
+
+    (defn collide-sdf-box-box [h1 sdf1 e1 h2 sdf2 e2]
+      (let [posA (SDF.position sdf1)
+            rotA (SDF.rotation sdf1)
+            scaleA @(SDF.scale sdf1)
+            halfA (Vector3.mul e1 scaleA)
+
+            posB (SDF.position sdf2)
+            rotB (SDF.rotation sdf2)
+            scaleB @(SDF.scale sdf2)
+            halfB (Vector3.mul e2 scaleB)
+
+            ;; Axes of A
+            uA0 (Quaternion.rotate rotA &(Vector3.init 1.0 0.0 0.0))
+            uA1 (Quaternion.rotate rotA &(Vector3.init 0.0 1.0 0.0))
+            uA2 (Quaternion.rotate rotA &(Vector3.init 0.0 0.0 1.0))
+
+            ;; Axes of B
+            uB0 (Quaternion.rotate rotB &(Vector3.init 1.0 0.0 0.0))
+            uB1 (Quaternion.rotate rotB &(Vector3.init 0.0 1.0 0.0))
+            uB2 (Quaternion.rotate rotB &(Vector3.init 0.0 0.0 1.0))
+
+            ;; Translation vector
+            T (Vector3.sub posB posA)
+
+            ;; Dot products (Rotation matrix R_ij)
+            R00 (Vector3.dot &uA0 &uB0)
+            R01 (Vector3.dot &uA0 &uB1)
+            R02 (Vector3.dot &uA0 &uB2)
+            R10 (Vector3.dot &uA1 &uB0)
+            R11 (Vector3.dot &uA1 &uB1)
+            R12 (Vector3.dot &uA1 &uB2)
+            R20 (Vector3.dot &uA2 &uB0)
+            R21 (Vector3.dot &uA2 &uB1)
+            R22 (Vector3.dot &uA2 &uB2)
+
+            ;; Abs rotation matrix
+            eps-val 0.00000001
+            absR00 (+ (abs R00) eps-val)
+            absR01 (+ (abs R01) eps-val)
+            absR02 (+ (abs R02) eps-val)
+            absR10 (+ (abs R10) eps-val)
+            absR11 (+ (abs R11) eps-val)
+            absR12 (+ (abs R12) eps-val)
+            absR20 (+ (abs R20) eps-val)
+            absR21 (+ (abs R21) eps-val)
+            absR22 (+ (abs R22) eps-val)
+
+            ;; Translation projected onto A's axes
+            t0 (Vector3.dot &T &uA0)
+            t1 (Vector3.dot &T &uA1)
+            t2 (Vector3.dot &T &uA2)
+
+            min-overlap Double.MAX
+            best-axis -1]
+        (do
+          ;; Test A's axes
+          ;; Axis 0: uA0
+          (let [ra @(Vector3.x &halfA)
+                rb (+ (* @(Vector3.x &halfB) absR00) (+ (* @(Vector3.y &halfB) absR01) (* @(Vector3.z &halfB) absR02)))
+                overlap (- (+ ra rb) (abs t0))]
+            (if (<= overlap 0.0)
+              (set! best-axis -2) ;; no collision, early out
+              (when (< overlap min-overlap)
+                (do (set! min-overlap overlap) (set! best-axis 0)))))
+
+          ;; Axis 1: uA1
+          (when (>= best-axis 0)
+            (let [ra @(Vector3.y &halfA)
+                  rb (+ (* @(Vector3.x &halfB) absR10) (+ (* @(Vector3.y &halfB) absR11) (* @(Vector3.z &halfB) absR12)))
+                  overlap (- (+ ra rb) (abs t1))]
+              (if (<= overlap 0.0)
+                (set! best-axis -2)
+                (when (< overlap min-overlap)
+                  (do (set! min-overlap overlap) (set! best-axis 1))))))
+
+          ;; Axis 2: uA2
+          (when (>= best-axis 0)
+            (let [ra @(Vector3.z &halfA)
+                  rb (+ (* @(Vector3.x &halfB) absR20) (+ (* @(Vector3.y &halfB) absR21) (* @(Vector3.z &halfB) absR22)))
+                  overlap (- (+ ra rb) (abs t2))]
+              (if (<= overlap 0.0)
+                (set! best-axis -2)
+                (when (< overlap min-overlap)
+                  (do (set! min-overlap overlap) (set! best-axis 2))))))
+
+          ;; Test B's axes
+          ;; Axis 3: uB0
+          (when (>= best-axis 0)
+            (let [ra (+ (* @(Vector3.x &halfA) absR00) (+ (* @(Vector3.y &halfA) absR10) (* @(Vector3.z &halfA) absR20)))
+                  rb @(Vector3.x &halfB)
+                  overlap (- (+ ra rb) (abs (+ (* t0 R00) (+ (* t1 R10) (* t2 R20)))))]
+              (if (<= overlap 0.0)
+                (set! best-axis -2)
+                (when (< overlap min-overlap)
+                  (do (set! min-overlap overlap) (set! best-axis 3))))))
+
+          ;; Axis 4: uB1
+          (when (>= best-axis 0)
+            (let [ra (+ (* @(Vector3.x &halfA) absR01) (+ (* @(Vector3.y &halfA) absR11) (* @(Vector3.z &halfA) absR21)))
+                  rb @(Vector3.y &halfB)
+                  overlap (- (+ ra rb) (abs (+ (* t0 R01) (+ (* t1 R11) (* t2 R21)))))]
+              (if (<= overlap 0.0)
+                (set! best-axis -2)
+                (when (< overlap min-overlap)
+                  (do (set! min-overlap overlap) (set! best-axis 4))))))
+
+          ;; Axis 5: uB2
+          (when (>= best-axis 0)
+            (let [ra (+ (* @(Vector3.x &halfA) absR02) (+ (* @(Vector3.y &halfA) absR12) (* @(Vector3.z &halfA) absR22)))
+                  rb @(Vector3.z &halfB)
+                  overlap (- (+ ra rb) (abs (+ (* t0 R02) (+ (* t1 R12) (* t2 R22)))))]
+              (if (<= overlap 0.0)
+                (set! best-axis -2)
+                (when (< overlap min-overlap)
+                  (do (set! min-overlap overlap) (set! best-axis 5))))))
+
+          ;; Test cross products
+          ;; Axis 6: uA0 x uB0
+          (when (>= best-axis 0)
+            (let [L-len-sq (- 1.0 (* R00 R00))]
+              (when (> L-len-sq 0.0001)
+                (let [len (sqrt L-len-sq)
+                      ra (+ (* @(Vector3.y &halfA) absR20) (* @(Vector3.z &halfA) absR10))
+                      rb (+ (* @(Vector3.y &halfB) absR02) (* @(Vector3.z &halfB) absR01))
+                      overlap (/ (- (+ ra rb) (abs (- (* t2 R10) (* t1 R20)))) len)]
+                  (if (<= overlap 0.0)
+                    (set! best-axis -2)
+                    (when (< overlap min-overlap)
+                      (do (set! min-overlap overlap) (set! best-axis 6))))))))
+
+          ;; Axis 7: uA0 x uB1
+          (when (>= best-axis 0)
+            (let [L-len-sq (- 1.0 (* R01 R01))]
+              (when (> L-len-sq 0.0001)
+                (let [len (sqrt L-len-sq)
+                      ra (+ (* @(Vector3.y &halfA) absR21) (* @(Vector3.z &halfA) absR11))
+                      rb (+ (* @(Vector3.x &halfB) absR02) (* @(Vector3.z &halfB) absR00))
+                      overlap (/ (- (+ ra rb) (abs (- (* t2 R11) (* t1 R21)))) len)]
+                  (if (<= overlap 0.0)
+                    (set! best-axis -2)
+                    (when (< overlap min-overlap)
+                      (do (set! min-overlap overlap) (set! best-axis 7))))))))
+
+          ;; Axis 8: uA0 x uB2
+          (when (>= best-axis 0)
+            (let [L-len-sq (- 1.0 (* R02 R02))]
+              (when (> L-len-sq 0.0001)
+                (let [len (sqrt L-len-sq)
+                      ra (+ (* @(Vector3.y &halfA) absR22) (* @(Vector3.z &halfA) absR12))
+                      rb (+ (* @(Vector3.x &halfB) absR01) (* @(Vector3.y &halfB) absR00))
+                      overlap (/ (- (+ ra rb) (abs (- (* t2 R12) (* t1 R22)))) len)]
+                  (if (<= overlap 0.0)
+                    (set! best-axis -2)
+                    (when (< overlap min-overlap)
+                      (do (set! min-overlap overlap) (set! best-axis 8))))))))
+
+          ;; Axis 9: uA1 x uB0
+          (when (>= best-axis 0)
+            (let [L-len-sq (- 1.0 (* R10 R10))]
+              (when (> L-len-sq 0.0001)
+                (let [len (sqrt L-len-sq)
+                      ra (+ (* @(Vector3.x &halfA) absR20) (* @(Vector3.z &halfA) absR00))
+                      rb (+ (* @(Vector3.y &halfB) absR12) (* @(Vector3.z &halfB) absR11))
+                      overlap (/ (- (+ ra rb) (abs (- (* t0 R20) (* t2 R00)))) len)]
+                  (if (<= overlap 0.0)
+                    (set! best-axis -2)
+                    (when (< overlap min-overlap)
+                      (do (set! min-overlap overlap) (set! best-axis 9))))))))
+
+          ;; Axis 10: uA1 x uB1
+          (when (>= best-axis 0)
+            (let [L-len-sq (- 1.0 (* R11 R11))]
+              (when (> L-len-sq 0.0001)
+                (let [len (sqrt L-len-sq)
+                      ra (+ (* @(Vector3.x &halfA) absR21) (* @(Vector3.z &halfA) absR01))
+                      rb (+ (* @(Vector3.x &halfB) absR12) (* @(Vector3.z &halfB) absR10))
+                      overlap (/ (- (+ ra rb) (abs (- (* t0 R21) (* t2 R01)))) len)]
+                  (if (<= overlap 0.0)
+                    (set! best-axis -2)
+                    (when (< overlap min-overlap)
+                      (do (set! min-overlap overlap) (set! best-axis 10))))))))
+
+          ;; Axis 11: uA1 x uB2
+          (when (>= best-axis 0)
+            (let [L-len-sq (- 1.0 (* R12 R12))]
+              (when (> L-len-sq 0.0001)
+                (let [len (sqrt L-len-sq)
+                      ra (+ (* @(Vector3.x &halfA) absR22) (* @(Vector3.z &halfA) absR02))
+                      rb (+ (* @(Vector3.x &halfB) absR11) (* @(Vector3.y &halfB) absR10))
+                      overlap (/ (- (+ ra rb) (abs (- (* t0 R22) (* t2 R02)))) len)]
+                  (if (<= overlap 0.0)
+                    (set! best-axis -2)
+                    (when (< overlap min-overlap)
+                      (do (set! min-overlap overlap) (set! best-axis 11))))))))
+
+          ;; Axis 12: uA2 x uB0
+          (when (>= best-axis 0)
+            (let [L-len-sq (- 1.0 (* R20 R20))]
+              (when (> L-len-sq 0.0001)
+                (let [len (sqrt L-len-sq)
+                      ra (+ (* @(Vector3.x &halfA) absR10) (* @(Vector3.y &halfA) absR00))
+                      rb (+ (* @(Vector3.y &halfB) absR22) (* @(Vector3.z &halfB) absR21))
+                      overlap (/ (- (+ ra rb) (abs (- (* t1 R00) (* t0 R10)))) len)]
+                  (if (<= overlap 0.0)
+                    (set! best-axis -2)
+                    (when (< overlap min-overlap)
+                      (do (set! min-overlap overlap) (set! best-axis 12))))))))
+
+          ;; Axis 13: uA2 x uB1
+          (when (>= best-axis 0)
+            (let [L-len-sq (- 1.0 (* R21 R21))]
+              (when (> L-len-sq 0.0001)
+                (let [len (sqrt L-len-sq)
+                      ra (+ (* @(Vector3.x &halfA) absR11) (* @(Vector3.y &halfA) absR01))
+                      rb (+ (* @(Vector3.x &halfB) absR22) (* @(Vector3.z &halfB) absR20))
+                      overlap (/ (- (+ ra rb) (abs (- (* t1 R01) (* t0 R11)))) len)]
+                  (if (<= overlap 0.0)
+                    (set! best-axis -2)
+                    (when (< overlap min-overlap)
+                      (do (set! min-overlap overlap) (set! best-axis 13))))))))
+
+          ;; Axis 14: uA2 x uB2
+          (when (>= best-axis 0)
+            (let [L-len-sq (- 1.0 (* R22 R22))]
+              (when (> L-len-sq 0.0001)
+                (let [len (sqrt L-len-sq)
+                      ra (+ (* @(Vector3.x &halfA) absR12) (* @(Vector3.y &halfA) absR02))
+                      rb (+ (* @(Vector3.x &halfB) absR21) (* @(Vector3.y &halfB) absR20))
+                      overlap (/ (- (+ ra rb) (abs (- (* t1 R02) (* t0 R12)))) len)]
+                  (if (<= overlap 0.0)
+                    (set! best-axis -2)
+                    (when (< overlap min-overlap)
+                      (do (set! min-overlap overlap) (set! best-axis 14))))))))
+
+          (if (< best-axis 0)
+            (Maybe.Nothing)
+            (let [norm (cond (= best-axis 0) @&uA0
+                             (= best-axis 1) @&uA1
+                             (= best-axis 2) @&uA2
+                             (= best-axis 3) @&uB0
+                             (= best-axis 4) @&uB1
+                             (= best-axis 5) @&uB2
+                             (= best-axis 6) (Vector3.normalize &(Vector3.cross &uA0 &uB0))
+                             (= best-axis 7) (Vector3.normalize &(Vector3.cross &uA0 &uB1))
+                             (= best-axis 8) (Vector3.normalize &(Vector3.cross &uA0 &uB2))
+                             (= best-axis 9) (Vector3.normalize &(Vector3.cross &uA1 &uB0))
+                             (= best-axis 10) (Vector3.normalize &(Vector3.cross &uA1 &uB1))
+                             (= best-axis 11) (Vector3.normalize &(Vector3.cross &uA1 &uB2))
+                             (= best-axis 12) (Vector3.normalize &(Vector3.cross &uA2 &uB0))
+                             (= best-axis 13) (Vector3.normalize &(Vector3.cross &uA2 &uB1))
+                             (Vector3.normalize &(Vector3.cross &uA2 &uB2)))]
+              (do
+                (when (< (Vector3.dot &norm &(Vector3.sub posA posB)) 0.0)
+                  (set! norm (Vector3.mul &norm -1.0)))
+                (let [ax @(Vector3.x &halfA) ay @(Vector3.y &halfA) az @(Vector3.z &halfA)
+                      bx @(Vector3.x &halfB) by @(Vector3.y &halfB) bz @(Vector3.z &halfB)
+                      contacts []]
                   (do
-                    (for [j 0 (Array.length contacts)]
-                      (when (< (Vector3.dist &v-contact (Contact.point (Array.unsafe-nth contacts j))) 0.05)
-                        (set! too-close true)))
-                    (when (not too-close)
-                      (Array.push-back! contacts (Contact.init depth v-contact norm-corrected))))))))
-          (for [i 0 (Array.length &offsets)]
-            (Vector3.delete @(Array.unsafe-nth &offsets i))))))
+                    ;; 8 vertices of A checked against B
+                    (let [vA-offsets [
+                            (Vector3.init ax ay az) (Vector3.init ax ay (neg az))
+                            (Vector3.init ax (neg ay) az) (Vector3.init ax (neg ay) (neg az))
+                            (Vector3.init (neg ax) ay az) (Vector3.init (neg ax) ay (neg az))
+                            (Vector3.init (neg ax) (neg ay) az) (Vector3.init (neg ax) (neg ay) (neg az))
+                          ]]
+                      (do
+                        (for [i 0 8]
+                          (let [offset (Array.unsafe-nth &vA-offsets i)
+                                v-world (Vector3.add posA &(Quaternion.rotate rotA offset))
+                                v-local-B (Quaternion.rotate &(Quaternion.inverse rotB) &(Vector3.sub &v-world posB))
+                                b-x (abs @(Vector3.x &v-local-B))
+                                b-y (abs @(Vector3.y &v-local-B))
+                                b-z (abs @(Vector3.z &v-local-B))]
+                            (when (and (<= b-x (+ bx 0.01)) (and (<= b-y (+ by 0.01)) (<= b-z (+ bz 0.01))))
+                              (Array.push-back! &contacts (Contact.init min-overlap @&v-world @&norm)))))
+                        (for [i 0 8]
+                          (Vector3.delete @(Array.unsafe-nth &vA-offsets i)))))
+
+                    ;; 8 vertices of B checked against A
+                    (let [vB-offsets [
+                            (Vector3.init bx by bz) (Vector3.init bx by (neg bz))
+                            (Vector3.init bx (neg by) bz) (Vector3.init bx (neg by) (neg bz))
+                            (Vector3.init (neg bx) by bz) (Vector3.init (neg bx) by (neg bz))
+                            (Vector3.init (neg bx) (neg by) bz) (Vector3.init (neg bx) (neg by) (neg bz))
+                          ]]
+                      (do
+                        (for [i 0 8]
+                          (let [offset (Array.unsafe-nth &vB-offsets i)
+                                v-world (Vector3.add posB &(Quaternion.rotate rotB offset))
+                                v-local-A (Quaternion.rotate &(Quaternion.inverse rotA) &(Vector3.sub &v-world posA))
+                                a-x (abs @(Vector3.x &v-local-A))
+                                a-y (abs @(Vector3.y &v-local-A))
+                                a-z (abs @(Vector3.z &v-local-A))]
+                            (when (and (<= a-x (+ ax 0.01)) (and (<= a-y (+ ay 0.01)) (<= a-z (+ az 0.01))))
+                              (Array.push-back! &contacts (Contact.init min-overlap @&v-world @&norm)))))
+                        (for [i 0 8]
+                          (Vector3.delete @(Array.unsafe-nth &vB-offsets i)))))
+
+                    ;; Fallback to midpoint of support points if no vertices are inside
+                    (when (Array.empty? &contacts)
+                      (let [sign-A-x (if (< (Vector3.dot &uA0 &(Vector3.mul &norm -1.0)) 0.0) -1.0 1.0)
+                            sign-A-y (if (< (Vector3.dot &uA1 &(Vector3.mul &norm -1.0)) 0.0) -1.0 1.0)
+                            sign-A-z (if (< (Vector3.dot &uA2 &(Vector3.mul &norm -1.0)) 0.0) -1.0 1.0)
+                            ax (* @(Vector3.x &halfA) sign-A-x)
+                            ay (* @(Vector3.y &halfA) sign-A-y)
+                            az (* @(Vector3.z &halfA) sign-A-z)
+
+                            sign-B-x (if (< (Vector3.dot &uB0 &norm) 0.0) -1.0 1.0)
+                            sign-B-y (if (< (Vector3.dot &uB1 &norm) 0.0) -1.0 1.0)
+                            sign-B-z (if (< (Vector3.dot &uB2 &norm) 0.0) -1.0 1.0)
+                            bx (* @(Vector3.x &halfB) sign-B-x)
+                            by (* @(Vector3.y &halfB) sign-B-y)
+                            bz (* @(Vector3.z &halfB) sign-B-z)
+
+                            mid-x (* (+ (+ @(Vector3.x posA) (+ (* @(Vector3.x &uA0) ax) (+ (* @(Vector3.x &uA1) ay) (* @(Vector3.x &uA2) az))))
+                                        (+ @(Vector3.x posB) (+ (* @(Vector3.x &uB0) bx) (+ (* @(Vector3.x &uB1) by) (* @(Vector3.x &uB2) bz))))) 0.5)
+                            mid-y (* (+ (+ @(Vector3.y posA) (+ (* @(Vector3.y &uA0) ax) (+ (* @(Vector3.y &uA1) ay) (* @(Vector3.y &uA2) az))))
+                                        (+ @(Vector3.y posB) (+ (* @(Vector3.y &uB0) bx) (+ (* @(Vector3.y &uB1) by) (* @(Vector3.y &uB2) bz))))) 0.5)
+                            mid-z (* (+ (+ @(Vector3.z posA) (+ (* @(Vector3.z &uA0) ax) (+ (* @(Vector3.z &uA1) ay) (* @(Vector3.z &uA2) az))))
+                                        (+ @(Vector3.z posB) (+ (* @(Vector3.z &uB0) bx) (+ (* @(Vector3.z &uB1) by) (* @(Vector3.z &uB2) bz))))) 0.5)
+                            mid-pt (Vector3.init mid-x mid-y mid-z)]
+                        (Array.push-back! &contacts (Contact.init min-overlap mid-pt @&norm))))
+
+                    (Maybe.Just (ContactSet.init @h1 @h2 contacts))))))))))
 
     (defn collide-sdf-sdf [h1 sdf1 h2 sdf2]
       (match @(SDF.base sdf1)
         (BaseShape.Surface plane1)
           (match @(SDF.base sdf2)
-            (BaseShape.Surface plane2)
-              (Maybe.Nothing)
-            _
-              (match (collide-sdf-plane h2 sdf2 h1 &plane1)
+            (BaseShape.Surface plane2) (Maybe.Nothing)
+            _ (match (collide-sdf-plane h2 sdf2 h1 &plane1)
                 (Maybe.Just cs) (Maybe.Just (ContactSet.reverse &cs))
                 (Maybe.Nothing) (Maybe.Nothing)))
+        (BaseShape.Ball r1)
+          (match @(SDF.base sdf2)
+            (BaseShape.Surface plane2)
+              (collide-sdf-plane h1 sdf1 h2 &plane2)
+            (BaseShape.Ball r2)
+              (collide-sdf-ball-ball h1 sdf1 r1 h2 sdf2 r2)
+            (BaseShape.Box e2)
+              (collide-sdf-ball-box h1 sdf1 r1 h2 sdf2 &e2)
+            _
+              (collide-sdf-generic h1 sdf1 h2 sdf2))
+        (BaseShape.Box e1)
+          (match @(SDF.base sdf2)
+            (BaseShape.Surface plane2)
+              (collide-sdf-plane h1 sdf1 h2 &plane2)
+            (BaseShape.Ball r2)
+              (match (collide-sdf-ball-box h2 sdf2 r2 h1 sdf1 &e1)
+                (Maybe.Just cs) (Maybe.Just (ContactSet.reverse &cs))
+                (Maybe.Nothing) (Maybe.Nothing))
+            (BaseShape.Box e2)
+              (collide-sdf-box-box h1 sdf1 &e1 h2 sdf2 &e2)
+            _
+              (collide-sdf-generic h1 sdf1 h2 sdf2))
         _
           (match @(SDF.base sdf2)
             (BaseShape.Surface plane2)
               (collide-sdf-plane h1 sdf1 h2 &plane2)
             _
-              (let [contacts []]
-                (do
-                  (sample-sdf-features! &contacts sdf1 sdf2 false)
-                  (sample-sdf-features! &contacts sdf2 sdf1 true)
-                  (if (Array.empty? &contacts)
-                      (Maybe.Nothing)
-                      (Maybe.Just (ContactSet.init @h1 @h2 contacts))))))))
+              (collide-sdf-generic h1 sdf1 h2 sdf2))))
 
     (defn collide-box-sdf [h-box box h-sdf sdf]
       (let [min-pt (AABB.min box)
